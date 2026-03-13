@@ -1,0 +1,6 @@
+python-telegram-bot==13.15
+python-dotenv==1.0.0
+# Совместимость ptb 13.x с Python 3.12
+urllib3==1.26.18
+# setuptools<82 даёт pkg_resources (нужен APScheduler от ptb 13.x)
+setuptools>=65.0.0,<82

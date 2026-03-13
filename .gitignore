@@ -1,0 +1,26 @@
+# Переменные окружения (токен)
+.env
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# База данных (опционально: раскомментируйте, если не хранить в репозитории)
+# notes_bot.db
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
