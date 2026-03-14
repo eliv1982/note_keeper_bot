@@ -6,10 +6,11 @@ Telegram-бот для управления заметками и категор
 
 import logging
 import os
+import re
 import sys
 import warnings
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 # Убираем предупреждения ptb 13.x и APScheduler (консоль и PowerShell не ругаются)
 warnings.filterwarnings("ignore", message=".*upstream urllib3.*", category=UserWarning)
@@ -53,9 +54,9 @@ def build_start_text(first_name: Optional[str]) -> str:
         "Команды:\n"
         "/newcategory — создать категорию\n"
         "/categories — список ваших категорий\n"
-        "/add — добавить заметку в категорию\n"
-        "/adddue — добавить заметку с напоминанием\n"
+        "/add — добавить заметку (текст и опционально срок напоминания)\n"
         "/get — показать заметки выбранной категории\n"
+        "/change — изменить заметку\n"
         "/delnote — удалить заметку\n"
         "/delcat — удалить категорию\n"
         "/cancel — отменить текущее действие\n"
@@ -262,6 +263,39 @@ def get_note_by_id_and_user(
         return None
 
 
+def update_note(
+    category_id: int,
+    note_id: int,
+    user_id: int,
+    new_text: str,
+    due_at_utc: Optional[str] = None,
+    remind_at_utc: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Обновить текст заметки и/или напоминание. Проверка прав через категорию.
+    Если due_at_utc и remind_at_utc оба None — убрать напоминание (бессрочная заметка).
+    Возвращает (True, None) при успехе или (False, сообщение_об_ошибке).
+    """
+    note = get_note_by_id_and_user(category_id, note_id, user_id)
+    if not note:
+        return False, "Заметка не найдена или у вас нет к ней доступа."
+    new_text = new_text.strip()
+    if not new_text:
+        return False, "Текст заметки не может быть пустым."
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE notes SET text = ?, due_at = ?, remind_at = ?, reminded = 0 "
+                "WHERE id = ? AND category_id = ?",
+                (new_text, due_at_utc, remind_at_utc, note_id, category_id),
+            )
+        export_notes_to_csv()
+        return True, None
+    except sqlite3.Error as e:
+        logger.exception("Ошибка при обновлении заметки: %s", e)
+        return False, "Не удалось обновить заметку. Попробуйте позже."
+
+
 def delete_note(
     category_id: int, note_id: int, user_id: int
 ) -> Tuple[bool, Optional[str]]:
@@ -394,6 +428,116 @@ def parse_due_datetime_to_utc(date_str: str, time_str: str) -> Optional[str]:
         return None
 
 
+# Московское время для расчёта "сегодня"
+MSK_UTC_OFFSET = timedelta(hours=3)
+
+
+def _next_weekday(start: datetime, weekday: int) -> datetime:
+    """Ближайший день недели (0=пн, 4=пт). Возвращает datetime в тот день с тем же временем, что start."""
+    d = start.date()
+    current = d.weekday()
+    if current == weekday:
+        return start
+    days_ahead = (weekday - current) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    next_d = d + timedelta(days=days_ahead)
+    return datetime.combine(next_d, start.time())
+
+
+def parse_due_message(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Извлечь из строки дату/время (МСК) и текст заметки.
+    Поддерживает:
+    - ДД.ММ.ГГГГ и ЧЧ:ММ в любом месте строки (остальное — текст заметки);
+    - сегодня/завтра/послезавтра + время;
+    - в пятницу + время (ближайшая пятница).
+    Возвращает (due_utc_str, note_text) или (None, None) при ошибке.
+    """
+    text = text.strip()
+    if not text:
+        return None, None
+
+    # 1) Ищем явную дату ДД.ММ.ГГГГ и время ЧЧ:ММ или Ч:ММ
+    date_match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", text)
+    time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+    if date_match and time_match:
+        date_str = f"{date_match.group(1)}.{date_match.group(2)}.{date_match.group(3)}"
+        time_str = f"{time_match.group(1)}:{time_match.group(2)}"
+        due_utc = parse_due_datetime_to_utc(date_str, time_str)
+        if due_utc is None:
+            return None, None
+        # Убираем найденные дату и время из строки (с конца, чтобы индексы не сбивались)
+        note = text
+        for m in sorted([date_match, time_match], key=lambda x: x.start(), reverse=True):
+            note = note[: m.start()] + " " + note[m.end() :]
+        note = " ".join(note.split()).strip()
+        if not note:
+            return None, None
+        return due_utc, note
+
+    # 2) Относительные даты: сегодня, завтра, послезавтра, в пятницу + время ЧЧ:ММ или "в 10"
+    now_msk = datetime.utcnow() + MSK_UTC_OFFSET
+    time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+    if time_match:
+        try:
+            hour, minute = int(time_match.group(1)), int(time_match.group(2))
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                return None, None
+        except ValueError:
+            return None, None
+    else:
+        # "в 10" или "в 9" — час без минут (10:00, 9:00)
+        time_match = re.search(r"\bв\s+(\d{1,2})\b", text, re.IGNORECASE)
+        if not time_match:
+            return None, None
+        time_span = time_match.span()
+        try:
+            hour = int(time_match.group(1))
+            if hour < 0 or hour > 23:
+                return None, None
+            minute = 0
+        except ValueError:
+            return None, None
+
+    target_date = None
+    lower = text.lower()
+    user_time = time(hour, minute, 0, 0)
+    if re.search(r"\bсегодня\b", lower):
+        target_date = datetime.combine(now_msk.date(), user_time)
+        if target_date <= now_msk:
+            target_date += timedelta(days=1)
+    elif re.search(r"\bзавтра\b", lower):
+        d = (now_msk + timedelta(days=1)).date()
+        target_date = datetime.combine(d, user_time)
+    elif re.search(r"\bпослезавтра\b", lower):
+        d = (now_msk + timedelta(days=2)).date()
+        target_date = datetime.combine(d, user_time)
+    elif re.search(r"\bв\s+пятницу\b|\bпятницу\b", lower):
+        next_fri = _next_weekday(now_msk, 4)
+        target_date = datetime.combine(next_fri.date(), user_time)
+        if target_date <= now_msk:
+            target_date += timedelta(days=7)
+    else:
+        return None, None
+
+    if target_date is None:
+        return None, None
+    # target_date в МСК, переводим в UTC
+    due_utc_dt = target_date - MSK_UTC_OFFSET
+    due_utc = due_utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+    note = text
+    # Удаляем из текста ключевые слова даты и найденный фрагмент времени (ЧЧ:ММ или "в 10")
+    keyword_matches = list(re.finditer(r"\b(сегодня|завтра|послезавтра|в\s+пятницу|пятницу)\b", text, re.IGNORECASE))
+    to_remove = keyword_matches + [time_match]
+    for m in sorted(to_remove, key=lambda x: x.start(), reverse=True):
+        note = note[: m.start()] + " " + note[m.end() :]
+    note = " ".join(note.split()).strip()
+    if not note:
+        return None, None
+    return due_utc, note
+
+
 def format_categories_list(cats: List[Tuple[int, str]]) -> str:
     """Форматирует список категорий для вывода пользователю с локальной нумерацией 1..N."""
     if not cats:
@@ -408,9 +552,7 @@ def build_categories_keyboard(
 ) -> InlineKeyboardMarkup:
     """
     Построить инлайн-клавиатуру для списка категорий.
-    action определяет, что делать при выборе:
-    - 'get'  -> показать заметки категории
-    - 'delcat' -> удалить категорию
+    action: get, delcat, add, adddue, delnote_cat
     """
     buttons: List[List[InlineKeyboardButton]] = []
     for idx, (cid, name) in enumerate(cats, start=1):
@@ -442,9 +584,11 @@ STATE_GET_CATEGORY = "get_category"
 STATE_ADD_INPUT = "add_input"
 STATE_ADD_TEXT = "add_text"
 STATE_ADD_DUE_INPUT = "add_due_input"
+STATE_ADD_DUE_TEXT = "add_due_text"
 STATE_DELNOTE_CATEGORY = "delnote_category"
 STATE_DELNOTE_NOTE = "delnote_note"
 STATE_DELCAT = "delcat_category"
+STATE_CHANGE_INPUT = "change_input"
 
 # Состояние храним в модульном словаре (context.user_data в ptb 13.x может не сохраняться между обновлениями)
 # Структура по user_id:
@@ -469,10 +613,17 @@ def _get_state(user_id: int) -> Optional[str]:
     return USER_STATES.get(user_id, {}).get("state")
 
 
-def _set_state(user_id: int, state: str, category_id: Optional[int] = None) -> None:
+def _set_state(
+    user_id: int,
+    state: str,
+    category_id: Optional[int] = None,
+    note_id: Optional[int] = None,
+) -> None:
     USER_STATES[user_id] = {"state": state}
     if category_id is not None:
         USER_STATES[user_id]["category_id"] = category_id
+    if note_id is not None:
+        USER_STATES[user_id]["note_id"] = note_id
 
 
 def _clear_user_state(user_id: int) -> None:
@@ -507,9 +658,10 @@ def cmd_help(update: Update, context: CallbackContext) -> None:
         "Краткая справка по командам:\n\n"
         "/newcategory — создать категорию\n"
         "/categories — список ваших категорий\n"
-        "/add — добавить заметку в категорию\n"
-        "/adddue — добавить заметку с напоминанием\n"
+        "/add — добавить заметку (текст; можно указать дату/время — тогда будет напоминание)\n"
+        "/adddue — добавить заметку с датой и временем напоминания\n"
         "/get — показать заметки выбранной категории\n"
+        "/change — изменить заметку (можно добавить или убрать напоминание)\n"
         "/delnote — удалить заметку\n"
         "/delcat — удалить категорию\n"
         "/cancel — отменить текущее действие\n\n"
@@ -598,6 +750,28 @@ def cb_delnote_category(update: Update, context: CallbackContext) -> None:
     )
 
 
+def cb_delnote_note(update: Update, context: CallbackContext) -> None:
+    """Удаление заметки по нажатию инлайн-кнопки."""
+    query = update.callback_query
+    assert query is not None
+    query.answer()
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+    data = query.data or ""
+    try:
+        _, raw_cat_id, raw_note_id = data.split(":", 2)
+        category_id = int(raw_cat_id)
+        note_id = int(raw_note_id)
+    except (ValueError, IndexError):
+        query.edit_message_text("Не удалось распознать выбранную заметку.")
+        return
+    ok, err = delete_note(category_id, note_id, user_id)
+    if err:
+        context.bot.send_message(chat_id=chat_id, text=err)
+        return
+    context.bot.send_message(chat_id=chat_id, text="Заметка удалена.")
+
+
 def cb_delcat_category(update: Update, context: CallbackContext) -> None:
     """Обработка выбора категории через кнопку для удаления категории."""
     query = update.callback_query
@@ -637,8 +811,9 @@ def cb_add_category(update: Update, context: CallbackContext) -> None:
     # Запоминаем, что дальше ждём только текст заметки для этой категории
     _set_state(user_id, STATE_ADD_TEXT, category_id=category_id)
     query.edit_message_text(
-        "Категория выбрана. Теперь отправьте текст заметки одним сообщением.\n"
-        "Если передумали, используйте /cancel."
+        "Категория выбрана. Введите текст заметки. Можно добавить дату и время для напоминания "
+        "(например завтра 13:00); без даты — заметка без напоминания.\n\n"
+        "Отмена: /cancel"
     )
 
 
@@ -657,15 +832,21 @@ def cmd_newcategory(update: Update, context: CallbackContext) -> None:
 
 
 def cmd_categories(update: Update, context: CallbackContext) -> None:
-    """Команда /categories — только список категорий."""
+    """Команда /categories — список категорий кнопками; по выбору — заметки в категории."""
     user_id = update.effective_user.id
     clear_state(context, user_id)
     cats = get_categories_by_user(user_id)
-    update.message.reply_text(format_categories_list(cats))
+    if not cats:
+        update.message.reply_text(format_categories_list(cats))
+        return
+    update.message.reply_text(
+        "Ваши категории. Выберите категорию, чтобы увидеть заметки в ней:",
+        reply_markup=build_categories_keyboard(cats, action="get"),
+    )
 
 
 def cmd_add(update: Update, context: CallbackContext) -> None:
-    """Команда /add — запрос номера категории и текста заметки."""
+    """Команда /add — добавить заметку (текст и опционально срок напоминания)."""
     user_id = update.effective_user.id
     clear_state(context, user_id)
     cats = get_categories_by_user(user_id)
@@ -675,8 +856,8 @@ def cmd_add(update: Update, context: CallbackContext) -> None:
     _set_state(user_id, STATE_ADD_INPUT)
     update.message.reply_text(
         format_categories_list(cats) + "\n\n"
-        "Выберите категорию кнопкой ниже или введите номер по списку и текст заметки "
-        "(например: 2 Купить молоко):",
+        "Выберите категорию кнопкой или введите номер и текст заметки. "
+        "Можно указать дату/время для напоминания (например: 2 Завтра 13:00 Позвонить или 2 Купить молоко):",
         reply_markup=build_categories_keyboard(cats, action="add"),
     )
 
@@ -692,9 +873,35 @@ def cmd_adddue(update: Update, context: CallbackContext) -> None:
     _set_state(user_id, STATE_ADD_DUE_INPUT)
     update.message.reply_text(
         format_categories_list(cats) + "\n\n"
-        "Введите номер категории, дату, время и текст заметки в формате:\n"
-        "2 20.03.2026 19:00 Купить подарок маме\n\n"
-        "Дата и время указываются по московскому времени.",
+        "Выберите категорию кнопкой или введите: номер и дату/время с текстом.\n"
+        "Дата: ДД.ММ.ГГГГ или сегодня / завтра / послезавтра / в пятницу. Время: ЧЧ:ММ (МСК).\n\n"
+        "Примеры: 2 15.03.2026 13:00 Тренировка  или  2 Тренировка завтра 13:00",
+        reply_markup=build_categories_keyboard(cats, action="adddue"),
+    )
+
+
+def cb_adddue_category(update: Update, context: CallbackContext) -> None:
+    """Выбор категории для заметки с напоминанием через кнопку."""
+    query = update.callback_query
+    assert query is not None
+    query.answer()
+    user_id = query.from_user.id
+    data = query.data or ""
+    try:
+        _, raw_id = data.split(":", 1)
+        category_id = int(raw_id)
+    except (ValueError, IndexError):
+        query.edit_message_text("Не удалось распознать выбранную категорию.")
+        return
+    _set_state(user_id, STATE_ADD_DUE_TEXT, category_id=category_id)
+    query.edit_message_text(
+        "Категория выбрана. Напишите дату, время и текст — порядок любой.\n\n"
+        "Дата: ДД.ММ.ГГГГ или сегодня / завтра / послезавтра / в пятницу.\n"
+        "Время: ЧЧ:ММ (МСК). Напоминание — за 1 час до срока.\n\n"
+        "Примеры:\n"
+        "15.03.2026 13:00 Тренировка\n"
+        "Тренировка завтра 13:00\n"
+        "Отмена: /cancel"
     )
 
 
@@ -749,6 +956,68 @@ def cmd_delcat(update: Update, context: CallbackContext) -> None:
     )
 
 
+def cmd_change(update: Update, context: CallbackContext) -> None:
+    """Команда /change — пошагово: категория, заметка, новый текст (можно с датой напоминания)."""
+    user_id = update.effective_user.id
+    clear_state(context, user_id)
+    cats = get_categories_by_user(user_id)
+    if not cats:
+        update.message.reply_text("У вас пока нет категорий. Создайте: /newcategory")
+        return
+    update.message.reply_text(
+        "Выберите категорию, в которой хотите изменить заметку:",
+        reply_markup=build_categories_keyboard(cats, action="change_cat"),
+    )
+
+
+def cb_change_category(update: Update, context: CallbackContext) -> None:
+    """Выбор категории для изменения заметки через кнопку."""
+    query = update.callback_query
+    assert query is not None
+    query.answer()
+    user_id = query.from_user.id
+    data = query.data or ""
+    try:
+        _, raw_id = data.split(":", 1)
+        category_id = int(raw_id)
+    except (ValueError, IndexError):
+        query.edit_message_text("Не удалось распознать выбранную категорию.")
+        return
+    rows, err = get_notes_by_category_and_user(category_id, user_id)
+    if err:
+        query.edit_message_text(err)
+        return
+    if not rows:
+        query.edit_message_text("В этой категории нет заметок.")
+        return
+    query.edit_message_text(
+        "Выберите заметку для изменения:",
+        reply_markup=build_notes_keyboard(rows, category_id, action="change_note"),
+    )
+
+
+def cb_change_note(update: Update, context: CallbackContext) -> None:
+    """Выбор заметки для изменения через кнопку."""
+    query = update.callback_query
+    assert query is not None
+    query.answer()
+    user_id = query.from_user.id
+    data = query.data or ""
+    try:
+        _, raw_cid, raw_nid = data.split(":", 2)
+        category_id = int(raw_cid)
+        note_id = int(raw_nid)
+    except (ValueError, IndexError):
+        query.edit_message_text("Не удалось распознать выбранную заметку.")
+        return
+    _set_state(user_id, STATE_CHANGE_INPUT, category_id=category_id, note_id=note_id)
+    query.edit_message_text(
+        "Введите новый текст заметки. Можно добавить дату и время для напоминания "
+        "(например завтра 13:00); если даты нет — заметка станет без напоминания.\n\n"
+        "Отмена: /cancel"
+    )
+
+
 def handle_text(update: Update, context: CallbackContext) -> None:
     """Обработка текстового ввода в зависимости от состояния."""
     user_id = update.effective_user.id
@@ -760,15 +1029,20 @@ def handle_text(update: Update, context: CallbackContext) -> None:
         return
 
     if state == STATE_NEWCATEGORY:
-        _clear_user_state(user_id)
-        clear_state(context, user_id)
         if not text:
             update.message.reply_text("Название не может быть пустым. Попробуйте снова или /cancel.")
             return
         _, err = create_category(user_id, text)
         if err:
-            update.message.reply_text(err)
+            if "уже существует" in (err or ""):
+                update.message.reply_text(
+                    "Такая категория уже есть. Введите другое название или отмените действие: /cancel"
+                )
+            else:
+                update.message.reply_text(err)
             return
+        _clear_user_state(user_id)
+        clear_state(context, user_id)
         update.message.reply_text("Категория создана.")
 
     elif state == STATE_GET_CATEGORY:
@@ -800,9 +1074,11 @@ def handle_text(update: Update, context: CallbackContext) -> None:
     elif state == STATE_ADD_INPUT:
         parts = text.split(None, 1)
         if len(parts) < 2:
-            update.message.reply_text("Введите номер категории и текст заметки (например: 2 Купить молоко или 2. Купить молоко).")
+            update.message.reply_text(
+                "Введите номер категории и текст заметки (например: 2 Купить молоко или 2 Завтра 13:00 Позвонить)."
+            )
             return
-        raw_id, note_text = parts[0], parts[1]
+        raw_id, rest = parts[0], parts[1]
         idx = _parse_category_or_note_number(raw_id)
         if idx is None:
             update.message.reply_text("Номер категории должен быть числом по списку (например 1, 2, 3).")
@@ -812,16 +1088,36 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             update.message.reply_text("Категории с таким номером нет в списке. Посмотрите список ещё раз: /categories")
             return
         category_id = cats[idx - 1][0]
+        due_utc, note_text = parse_due_message(rest)
+        if not note_text:
+            update.message.reply_text("Текст заметки не может быть пустым.")
+            return
         _clear_user_state(user_id)
         clear_state(context, user_id)
-        _, err = add_note(category_id, user_id, note_text)
-        if err:
-            update.message.reply_text(err)
-            return
-        update.message.reply_text("Заметка добавлена.")
+        if due_utc:
+            try:
+                due_dt_utc = datetime.fromisoformat(due_utc)
+                remind_dt_utc = due_dt_utc - timedelta(hours=1)
+                remind_utc = remind_dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                remind_utc = None
+            _, err = add_note(
+                category_id, user_id, note_text,
+                due_at_utc=due_utc, remind_at_utc=remind_utc,
+            )
+            if err:
+                update.message.reply_text(err)
+                return
+            update.message.reply_text("Заметка с напоминанием добавлена.")
+        else:
+            _, err = add_note(category_id, user_id, note_text)
+            if err:
+                update.message.reply_text(err)
+                return
+            update.message.reply_text("Заметка добавлена.")
 
     elif state == STATE_ADD_TEXT:
-        # Текст заметки для категории, выбранной кнопкой
+        # Текст заметки для категории, выбранной кнопкой. Опционально — дата/время для напоминания.
         user_state = USER_STATES.get(user_id, {})
         category_id = user_state.get("category_id")
         if category_id is None:
@@ -829,28 +1125,114 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             clear_state(context, user_id)
             update.message.reply_text("Категория не найдена. Начните заново: /add")
             return
-        note_text = text
+        due_utc, note_text = parse_due_message(text)
         if not note_text:
             update.message.reply_text("Текст заметки не может быть пустым. Введите текст или /cancel.")
             return
-        _, err = add_note(category_id, user_id, note_text)
         _clear_user_state(user_id)
         clear_state(context, user_id)
+        if due_utc:
+            try:
+                due_dt_utc = datetime.fromisoformat(due_utc)
+                remind_dt_utc = due_dt_utc - timedelta(hours=1)
+                remind_utc = remind_dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                remind_utc = None
+            _, err = add_note(
+                category_id, user_id, note_text,
+                due_at_utc=due_utc, remind_at_utc=remind_utc,
+            )
+            if err:
+                update.message.reply_text(err)
+                return
+            update.message.reply_text("Заметка с напоминанием добавлена.")
+        else:
+            _, err = add_note(category_id, user_id, note_text)
+            if err:
+                update.message.reply_text(err)
+                return
+            update.message.reply_text("Заметка добавлена.")
+
+    elif state == STATE_ADD_DUE_TEXT:
+        # Категория уже выбрана кнопкой. В строке — дата/время и текст в любом порядке
+        user_state = USER_STATES.get(user_id, {})
+        category_id = user_state.get("category_id")
+        if category_id is None:
+            _clear_user_state(user_id)
+            clear_state(context, user_id)
+            update.message.reply_text("Сессия сброшена. Начните заново: /adddue")
+            return
+        due_utc, note_text = parse_due_message(text)
+        if due_utc is None or not note_text:
+            update.message.reply_text(
+                "Не удалось найти дату и время. Укажите дату (ДД.ММ.ГГГГ) и время (ЧЧ:ММ) "
+                "или: сегодня/завтра/послезавтра/в пятницу и время. Примеры:\n"
+                "15.03.2026 13:00 Тренировка\nТренировка завтра 13:00"
+            )
+            return
+        try:
+            due_dt_utc = datetime.fromisoformat(due_utc)
+            remind_dt_utc = due_dt_utc - timedelta(hours=1)
+            remind_utc = remind_dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            remind_utc = None
+        _clear_user_state(user_id)
+        clear_state(context, user_id)
+        _, err = add_note(
+            category_id, user_id, note_text,
+            due_at_utc=due_utc, remind_at_utc=remind_utc,
+        )
         if err:
             update.message.reply_text(err)
             return
-        update.message.reply_text("Заметка добавлена.")
+        update.message.reply_text("Заметка с напоминанием добавлена.")
+
+    elif state == STATE_CHANGE_INPUT:
+        user_state = USER_STATES.get(user_id, {})
+        category_id = user_state.get("category_id")
+        note_id = user_state.get("note_id")
+        if category_id is None or note_id is None:
+            _clear_user_state(user_id)
+            clear_state(context, user_id)
+            update.message.reply_text("Сессия сброшена. Начните заново: /change")
+            return
+        due_utc, note_text = parse_due_message(text)
+        if not note_text:
+            update.message.reply_text("Текст заметки не может быть пустым. Введите новый текст или /cancel.")
+            return
+        _clear_user_state(user_id)
+        clear_state(context, user_id)
+        if due_utc:
+            try:
+                due_dt_utc = datetime.fromisoformat(due_utc)
+                remind_dt_utc = due_dt_utc - timedelta(hours=1)
+                remind_utc = remind_dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                remind_utc = None
+            ok, err = update_note(
+                category_id, note_id, user_id, note_text,
+                due_at_utc=due_utc, remind_at_utc=remind_utc,
+            )
+        else:
+            ok, err = update_note(
+                category_id, note_id, user_id, note_text,
+                due_at_utc=None, remind_at_utc=None,
+            )
+        if err:
+            update.message.reply_text(err)
+            return
+        update.message.reply_text("Заметка изменена.")
 
     elif state == STATE_ADD_DUE_INPUT:
-        # Ожидаем: <номер_категории> <ДД.ММ.ГГГГ> <ЧЧ:ММ> <текст>
-        parts = text.split(None, 3)
-        if len(parts) < 4:
+        # Ожидаем: номер_категории и остальное — дата/время и текст (в любом порядке)
+        parts = text.split(None, 1)
+        if len(parts) < 2:
             update.message.reply_text(
-                "Введите номер категории, дату, время и текст заметки в формате:\n"
-                "2 20.03.2026 19:00 Купить подарок маме"
+                "Введите номер категории и дату/время с текстом. Примеры:\n"
+                "2 15.03.2026 13:00 Тренировка\n2 Тренировка завтра 13:00"
             )
             return
-        raw_idx, date_str, time_str, note_text = parts
+        raw_idx, rest = parts[0], parts[1]
         idx = _parse_category_or_note_number(raw_idx)
         if idx is None:
             update.message.reply_text("Номер категории должен быть числом по списку (например 1, 2, 3).")
@@ -859,11 +1241,11 @@ def handle_text(update: Update, context: CallbackContext) -> None:
         if not cats or idx < 1 or idx > len(cats):
             update.message.reply_text("Категории с таким номером нет в списке. Посмотрите список ещё раз: /categories")
             return
-        due_utc = parse_due_datetime_to_utc(date_str, time_str)
-        if due_utc is None:
+        due_utc, note_text = parse_due_message(rest)
+        if due_utc is None or not note_text:
             update.message.reply_text(
-                "Не удалось разобрать дату и время. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ,\n"
-                "например: 20.03.2026 19:00"
+                "Не удалось найти дату и время в сообщении. Укажите ДД.ММ.ГГГГ и ЧЧ:ММ "
+                "или: сегодня/завтра/послезавтра/в пятницу и время."
             )
             return
         # Напоминание за 1 час до срока (в московском времени), пересчитанное в UTC
@@ -1058,11 +1440,18 @@ def main() -> None:
     dp.add_handler(CommandHandler("get", cmd_get))
     dp.add_handler(CommandHandler("delnote", cmd_delnote))
     dp.add_handler(CommandHandler("delcat", cmd_delcat))
+    dp.add_handler(CommandHandler("change", cmd_change))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
-    # Обработчики инлайн-кнопок по категориям
+    # Обработчики инлайн-кнопок по категориям и заметкам
     dp.add_handler(CallbackQueryHandler(cb_get_category, pattern=r"^get:\d+$"))
     dp.add_handler(CallbackQueryHandler(cb_delcat_category, pattern=r"^delcat:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_add_category, pattern=r"^add:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_adddue_category, pattern=r"^adddue:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_delnote_category, pattern=r"^delnote_cat:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_delnote_note, pattern=r"^delnote:\d+:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_change_category, pattern=r"^change_cat:\d+$"))
+    dp.add_handler(CallbackQueryHandler(cb_change_note, pattern=r"^change_note:\d+:\d+$"))
 
     dp.add_error_handler(error_handler)
 
