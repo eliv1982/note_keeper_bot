@@ -94,7 +94,6 @@ def parse_due_message(text: str) -> Tuple[Optional[str], Optional[str]]:
         time_match = re.search(r"\bв\s+(\d{1,2})\b", text, re.IGNORECASE)
         if not time_match:
             return None, None
-        time_span = time_match.span()
         try:
             hour = int(time_match.group(1))
             if hour < 0 or hour > 23:
