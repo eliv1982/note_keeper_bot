@@ -193,6 +193,15 @@ sudo chown $(whoami):$(whoami) /opt/notes-bot
 - каталог `output/` с экспортом `notes.csv`;
 - файл `.env` с токеном.
 
+Контейнер работает от непривилегированного пользователя (uid 1000), поэтому файл БД и
+папку экспорта нужно создать и передать ему во владение заранее:
+
+```bash
+touch /opt/notes-bot/notes_bot.db
+mkdir -p /opt/notes-bot/output
+chown 1000:1000 /opt/notes-bot/notes_bot.db /opt/notes-bot/output   # контейнер пишет от uid 1000
+```
+
 2. Создайте `.env` с токеном бота (на сервере, в `/opt/notes-bot`):
 
 ```bash
@@ -228,16 +237,17 @@ docker pull <dockerhub_user>/notes-bot:latest
 docker run -d \
   --name notes-bot \
   --restart unless-stopped \
-  -v /opt/notes-bot:/app \
+  --env-file /opt/notes-bot/.env \
+  -v /opt/notes-bot/notes_bot.db:/app/notes_bot.db \
+  -v /opt/notes-bot/output:/app/output \
   <dockerhub_user>/notes-bot:latest
 ```
 
 Пояснения:
 
 - `--restart unless-stopped` — контейнер автоматически перезапустится после перезагрузки сервера или падения Docker;
-- `-v /opt/notes-bot:/app` — внутрь контейнера монтируется каталог `/opt/notes-bot` как рабочая директория `/app`:
-  - там лежит `.env` с токеном;
-  - там будут храниться `notes_bot.db` и `output/` между перезапусками.
+- `--env-file /opt/notes-bot/.env` — токен передаётся в контейнер как переменная окружения, сам файл `.env` внутрь контейнера не попадает;
+- `-v /opt/notes-bot/notes_bot.db:/app/notes_bot.db` и `-v /opt/notes-bot/output:/app/output` — база и экспорт монтируются по отдельности и сохраняются между перезапусками. **Не монтируйте весь `/opt/notes-bot` в `/app`** — это скроет код бота (`bot.py`), уже находящийся внутри образа, и контейнер не запустится.
 
 Логи контейнера:
 
@@ -288,11 +298,13 @@ docker rm notes-bot
 docker run -d \
   --name notes-bot \
   --restart unless-stopped \
-  -v /opt/notes-bot:/app \
+  --env-file /opt/notes-bot/.env \
+  -v /opt/notes-bot/notes_bot.db:/app/notes_bot.db \
+  -v /opt/notes-bot/output:/app/output \
   <dockerhub_user>/notes-bot:latest
 ```
 
-База `notes_bot.db` и файл `.env` не затрагиваются — они находятся на хосте.
+База `notes_bot.db`, папка `output/` и файл `.env` не затрагиваются — они находятся на хосте.
 
 ## Возможные проблемы
 
@@ -301,6 +313,6 @@ docker run -d \
   - логи контейнера: `docker logs -n 100 notes-bot`;
   - токен в `/opt/notes-bot/.env`.
 - **Нет сети у контейнера** — проверьте доступ сервера в интернет (ping, curl до `https://api.telegram.org`).
-- **Permission denied / права на файлы** — убедитесь, что пользователь Docker имеет права на `/opt/notes-bot` и `.env` доступен для чтения внутри контейнера (можно проверить `docker exec -it notes-bot ls -la`).
+- **Permission denied / права на файлы** — контейнер пишет от uid 1000; убедитесь, что `/opt/notes-bot/notes_bot.db` и `/opt/notes-bot/output` принадлежат `1000:1000` (`chown 1000:1000 ...`, см. §9.2), а `/opt/notes-bot/.env` читается пользователем, от которого запущен `docker` на хосте (сам файл `.env` внутрь контейнера не монтируется).
 - **ModuleNotFoundError при системном запуске (старый вариант без Docker)** — убедитесь, что в `ExecStart` указан Python из `venv`: `/path/to/bot_notes/venv/bin/python`.
 
