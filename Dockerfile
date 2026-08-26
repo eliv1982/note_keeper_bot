@@ -15,6 +15,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Непривилегированный пользователь для запуска бота.
+# /app принадлежит ему, чтобы notes_bot.db и output/ можно было создавать и писать в рантайме.
+RUN useradd --create-home --uid 1000 appuser \
+ && mkdir -p /app/output \
+ && chown -R appuser:appuser /app
+USER appuser
+
 # Телеграм-токен передаётся через переменную окружения TELEGRAM_BOT_TOKEN
 
 CMD ["python", "bot.py"]

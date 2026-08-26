@@ -301,11 +301,12 @@ def delete_note(
 ) -> Tuple[bool, Optional[str]]:
     """
     Удалить заметку. Проверка прав через категорию.
+    Если заметка уже удалена (например повторный callback), возвращает (True, None) — идемпотентность.
     Возвращает (True, None) при успехе или (False, сообщение_об_ошибке).
     """
     note = get_note_by_id_and_user(category_id, note_id, user_id)
     if not note:
-        return False, "Заметка не найдена или у вас нет к ней доступа."
+        return True, None  # уже удалена — считаем успехом, чтобы не слать лишнее сообщение об ошибке
     try:
         with get_db_connection() as conn:
             conn.execute(
@@ -527,11 +528,15 @@ def parse_due_message(text: str) -> Tuple[Optional[str], Optional[str]]:
     due_utc_dt = target_date - MSK_UTC_OFFSET
     due_utc = due_utc_dt.strftime("%Y-%m-%d %H:%M:%S")
     note = text
-    # Удаляем из текста ключевые слова даты и найденный фрагмент времени (ЧЧ:ММ или "в 10")
+    # Собираем интервалы для удаления: ключевые слова даты и фрагмент времени (ЧЧ:ММ или "в 10")
     keyword_matches = list(re.finditer(r"\b(сегодня|завтра|послезавтра|в\s+пятницу|пятницу)\b", text, re.IGNORECASE))
-    to_remove = keyword_matches + [time_match]
-    for m in sorted(to_remove, key=lambda x: x.start(), reverse=True):
-        note = note[: m.start()] + " " + note[m.end() :]
+    spans = [(m.start(), m.end()) for m in keyword_matches] + [(time_match.start(), time_match.end())]
+    # Если перед временем ЧЧ:ММ стоит "в " (например "завтра в 10:00"), убрать предлог из заметки
+    i = time_match.start()
+    if i >= 2 and text[i - 2 : i] == "в ":
+        spans.append((i - 2, i))
+    for start, end in sorted(spans, key=lambda x: x[0], reverse=True):
+        note = note[:start] + " " + note[end:]
     note = " ".join(note.split()).strip()
     if not note:
         return None, None
@@ -751,12 +756,11 @@ def cb_delnote_category(update: Update, context: CallbackContext) -> None:
 
 
 def cb_delnote_note(update: Update, context: CallbackContext) -> None:
-    """Удаление заметки по нажатию инлайн-кнопки."""
+    """Удаление заметки по нажатию инлайн-кнопки. Сообщение с кнопкой заменяется текстом об успехе."""
     query = update.callback_query
     assert query is not None
     query.answer()
     user_id = query.from_user.id
-    chat_id = query.message.chat.id
     data = query.data or ""
     try:
         _, raw_cat_id, raw_note_id = data.split(":", 2)
@@ -767,9 +771,9 @@ def cb_delnote_note(update: Update, context: CallbackContext) -> None:
         return
     ok, err = delete_note(category_id, note_id, user_id)
     if err:
-        context.bot.send_message(chat_id=chat_id, text=err)
+        query.edit_message_text(err)
         return
-    context.bot.send_message(chat_id=chat_id, text="Заметка удалена.")
+    query.edit_message_text("Заметка удалена.")
 
 
 def cb_delcat_category(update: Update, context: CallbackContext) -> None:

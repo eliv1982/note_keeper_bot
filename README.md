@@ -55,7 +55,14 @@ python bot.py
 
 ### Локальный образ
 
+Контейнер работает от непривилегированного пользователя (uid 1000), поэтому файл БД и
+папку экспорта нужно один раз создать и передать ему во владение до первого запуска:
+
 ```bash
+touch notes_bot.db
+mkdir -p output
+chown 1000:1000 notes_bot.db output   # на Linux-хосте; иначе контейнер не сможет писать в них
+
 docker build -t notes-bot .
 docker run -d \
   --name notes-bot \
@@ -84,7 +91,9 @@ docker run -d \
 
    ```bash
    docker pull <dockerhub_user>/notes-bot:latest
+   touch /opt/notes-bot/notes_bot.db
    mkdir -p /opt/notes-bot/output
+   chown 1000:1000 /opt/notes-bot/notes_bot.db /opt/notes-bot/output   # контейнер пишет от uid 1000
 
    # создайте /opt/notes-bot/.env с TELEGRAM_BOT_TOKEN
 
@@ -119,7 +128,7 @@ docker run -d \
 ## Структура проекта
 
 ```
-Bot_notes/
+note_keeper_bot/
 ├── bot.py           # Код бота
 ├── requirements.txt
 ├── .env.example     # Пример переменных окружения
