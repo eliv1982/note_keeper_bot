@@ -28,7 +28,7 @@ sudo apt install python3 python3-venv python3-pip -y
   cd bot_notes
   ```
 
-- **SCP/SFTP**: скопируйте папку с `bot.py`, `requirements.txt`, `.env.example` на сервер в каталог, например `/home/ubuntu/bot_notes`.
+- **SCP/SFTP**: скопируйте папку проекта целиком (`bot.py`, `handlers.py`, `reminders.py`, `db.py`, `parsing.py`, `requirements.txt`, `.env.example`) на сервер в каталог, например `/home/ubuntu/bot_notes`.
 
 Перейдите в каталог проекта:
 
